@@ -1,15 +1,26 @@
 twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
+    var ourTwitchAdSolutionsVersion = 6;// Only bump this when there's a breaking change to Twitch, the script, or there's a conflict with an unmaintained extension which uses this script
+    if (typeof unsafeWindow === 'undefined') {
+        unsafeWindow = window;
+    }
+    if (typeof unsafeWindow.twitchAdSolutionsVersion !== 'undefined' && unsafeWindow.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
+        console.log("skipping video-swap-new as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + unsafeWindow.twitchAdSolutionsVersion);
+        unsafeWindow.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
+        return;
+    }
+    unsafeWindow.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
     function declareOptions(scope) {
         // Options / globals
-        scope.OPT_ROLLING_DEVICE_ID = true;
         scope.OPT_MODE_STRIP_AD_SEGMENTS = true;
         scope.OPT_MODE_NOTIFY_ADS_WATCHED = true;
         scope.OPT_MODE_NOTIFY_ADS_WATCHED_MIN_REQUESTS = false;
-        scope.OPT_BACKUP_PLAYER_TYPE = 'embed';
+        scope.OPT_BACKUP_PLAYER_TYPE = 'autoplay';
+        scope.OPT_BACKUP_PLATFORM = 'ios';
         scope.OPT_REGULAR_PLAYER_TYPE = 'site';
-        scope.OPT_ACCESS_TOKEN_PLAYER_TYPE = 'site';
+        scope.OPT_ACCESS_TOKEN_PLAYER_TYPE = null;
+        scope.OPT_SHOW_AD_BANNER = true;
         scope.AD_SIGNIFIER = 'stitched-ad';
         scope.LIVE_SIGNIFIER = ',live';
         scope.CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
@@ -19,102 +30,197 @@ twitch-videoad.js text/javascript
         scope.CurrentChannelNameFromM3U8 = null;
         // Need this in both scopes. Window scope needs to update this to worker scope.
         scope.gql_device_id = null;
-        scope.gql_device_id_rolling = '';
-        // Rolling device id crap... TODO: improve this
-        var charTable = []; for (var i = 97; i <= 122; i++) { charTable.push(String.fromCharCode(i)); } for (var i = 65; i <= 90; i++) { charTable.push(String.fromCharCode(i)); } for (var i = 48; i <= 57; i++) { charTable.push(String.fromCharCode(i)); }
-        var bs = 'eVI6jx47kJvCFfFowK86eVI6jx47kJvC';
-        var di = (new Date()).getUTCFullYear() + (new Date()).getUTCMonth() + ((new Date()).getUTCDate() / 7) | 0;
-        for (var i = 0; i < bs.length; i++) {
-            scope.gql_device_id_rolling += charTable[(bs.charCodeAt(i) ^ di) % charTable.length];
-        }
-        scope.gql_device_id_rolling = '1';//temporary
+        scope.ClientIntegrityHeader = null;
+        scope.AuthorizationHeader = null;
     }
-    declareOptions(window);
-    var twitchMainWorker = null;
-    const oldWorker = window.Worker;
-    window.Worker = class Worker extends oldWorker {
-        constructor(twitchBlobUrl) {
-            if (twitchMainWorker) {
-                super(twitchBlobUrl);
-                return;
+    var twitchWorkers = [];
+    var workerStringConflicts = [
+        'twitch',
+        'isVariantA'// TwitchNoSub
+    ];
+    var workerStringAllow = [];
+    var workerStringReinsert = [
+        'isVariantA',// TwitchNoSub (prior to (0.9))
+        'besuper/',// TwitchNoSub (0.9)
+        '${patch_url}'// TwitchNoSub (0.9.1)
+    ];
+    function getCleanWorker(worker) {
+        var root = null;
+        var parent = null;
+        var proto = worker;
+        while (proto) {
+            var workerString = proto.toString();
+            if (workerStringConflicts.some((x) => workerString.includes(x)) && !workerStringAllow.some((x) => workerString.includes(x))) {
+                if (parent !== null) {
+                    Object.setPrototypeOf(parent, Object.getPrototypeOf(proto));
+                }
+            } else {
+                if (root === null) {
+                    root = proto;
+                }
+                parent = proto;
             }
-            var jsURL = getWasmWorkerUrl(twitchBlobUrl);
-            if (typeof jsURL !== 'string') {
-                super(twitchBlobUrl);
-                return;
+            proto = Object.getPrototypeOf(proto);
+        }
+        return root;
+    }
+    function getWorkersForReinsert(worker) {
+        var result = [];
+        var proto = worker;
+        while (proto) {
+            var workerString = proto.toString();
+            if (workerStringReinsert.some((x) => workerString.includes(x))) {
+                result.push(proto);
+            } else {
             }
-            var newBlobStr = `
-                ${processM3U8.toString()}
-                ${hookWorkerFetch.toString()}
-                ${declareOptions.toString()}
-                ${getAccessToken.toString()}
-                ${gqlRequest.toString()}
-                ${makeGraphQlPacket.toString()}
-                ${tryNotifyAdsWatchedM3U8.toString()}
-                ${parseAttributes.toString()}
-                ${onFoundAd.toString()}
-                declareOptions(self);
-                self.addEventListener('message', function(e) {
-                    if (e.data.key == 'UboUpdateDeviceId') {
-                        gql_device_id = e.data.value;
+            proto = Object.getPrototypeOf(proto);
+        }
+        return result;
+    }
+    function reinsertWorkers(worker, reinsert) {
+        var parent = worker;
+        for (var i = 0; i < reinsert.length; i++) {
+            Object.setPrototypeOf(reinsert[i], parent);
+            parent = reinsert[i];
+        }
+        return parent;
+    }
+    function isValidWorker(worker) {
+        var workerString = worker.toString();
+        return !workerStringConflicts.some((x) => workerString.includes(x))
+            || workerStringAllow.some((x) => workerString.includes(x))
+            || workerStringReinsert.some((x) => workerString.includes(x));
+    }
+    function hookWindowWorker() {
+        var reinsert = getWorkersForReinsert(unsafeWindow.Worker);
+        var newWorker = class Worker extends getCleanWorker(unsafeWindow.Worker) {
+            constructor(twitchBlobUrl, options) {
+                var isTwitchWorker = false;
+                try {
+                    isTwitchWorker = new URL(twitchBlobUrl).origin.endsWith('.twitch.tv');
+                } catch {}
+                if (!isTwitchWorker) {
+                    super(twitchBlobUrl, options);
+                    return;
+                }
+                var newBlobStr = `
+                    const pendingFetchRequests = new Map();
+                    ${processM3U8.toString()}
+                    ${hookWorkerFetch.toString()}
+                    ${declareOptions.toString()}
+                    ${getAccessToken.toString()}
+                    ${gqlRequest.toString()}
+                    ${makeGraphQlPacket.toString()}
+                    ${tryNotifyAdsWatchedM3U8.toString()}
+                    ${parseAttributes.toString()}
+                    ${onFoundAd.toString()}
+                    ${getWasmWorkerJs.toString()}
+                    var workerString = getWasmWorkerJs('${twitchBlobUrl.replaceAll("'", "%27")}');
+                    declareOptions(self);
+                    self.addEventListener('message', function(e) {
+                        if (e.data.key == 'UboUpdateDeviceId') {
+                            gql_device_id = e.data.value;
+                        } else if (e.data.key == 'UpdateClientIntegrityHeader') {
+                            ClientIntegrityHeader = e.data.value;
+                        } else if (e.data.key == 'UpdateAuthorizationHeader') {
+                            AuthorizationHeader = e.data.value;
+                        } else if (e.data.key == 'FetchResponse') {
+                            const responseData = e.data.value;
+                            if (pendingFetchRequests.has(responseData.id)) {
+                                const { resolve, reject } = pendingFetchRequests.get(responseData.id);
+                                pendingFetchRequests.delete(responseData.id);
+                                if (responseData.error) {
+                                    reject(new Error(responseData.error));
+                                } else {
+                                    // Create a Response object from the response data
+                                    const response = new Response(responseData.body, {
+                                        status: responseData.status,
+                                        statusText: responseData.statusText,
+                                        headers: responseData.headers
+                                    });
+                                    resolve(response);
+                                }
+                            }
+                        }
+                    });
+                    hookWorkerFetch();
+                    eval(workerString);
+                `
+                super(URL.createObjectURL(new Blob([newBlobStr])), options);
+                twitchWorkers.push(this);
+                this.addEventListener('message', (e) => {
+                    // NOTE: Removed adDiv caching as '.video-player' can change between streams?
+                    if (e.data.key == 'UboShowAdBanner') {
+                        var adDiv = getAdDiv();
+                        if (adDiv != null) {
+                            adDiv.P.textContent = 'Blocking' + (e.data.isMidroll ? ' midroll' : '') + ' ads';
+                            if (OPT_SHOW_AD_BANNER) {
+                                adDiv.style.display = 'block';
+                            }
+                        }
+                    } else if (e.data.key == 'UboHideAdBanner') {
+                        var adDiv = getAdDiv();
+                        if (adDiv != null) {
+                            adDiv.style.display = 'none';
+                        }
+                    } else if (e.data.key == 'UboChannelNameM3U8Changed') {
+                        //console.log('M3U8 channel name changed to ' + e.data.value);
+                    } else if (e.data.key == 'UboReloadPlayer') {
+                        reloadTwitchPlayer();
+                    } else if (e.data.key == 'UboPauseResumePlayer') {
+                        reloadTwitchPlayer(false, true);
+                    } else if (e.data.key == 'UboSeekPlayer') {
+                        reloadTwitchPlayer(true);
                     }
                 });
-                hookWorkerFetch();
-                importScripts('${jsURL}');
-            `
-            super(URL.createObjectURL(new Blob([newBlobStr])));
-            twitchMainWorker = this;
-            this.onmessage = function(e) {
-                // NOTE: Removed adDiv caching as '.video-player' can change between streams?
-                if (e.data.key == 'UboShowAdBanner') {
-                    var adDiv = getAdDiv();
-                    if (adDiv != null) {
-                        adDiv.P.textContent = 'Blocking' + (e.data.isMidroll ? ' midroll' : '') + ' ads...';
-                        //adDiv.style.display = 'block';
+                this.addEventListener('message', async event => {
+                    if (event.data.key == 'FetchRequest') {
+                        const fetchRequest = event.data.value;
+                        const responseData = await handleWorkerFetchRequest(fetchRequest);
+                        this.postMessage({
+                            key: 'FetchResponse',
+                            value: responseData
+                        });
                     }
-                }
-                else if (e.data.key == 'UboHideAdBanner') {
-                    var adDiv = getAdDiv();
-                    if (adDiv != null) {
-                        adDiv.style.display = 'none';
+                });
+                function getAdDiv() {
+                    var playerRootDiv = document.querySelector('.video-player');
+                    var adDiv = null;
+                    if (playerRootDiv != null) {
+                        adDiv = playerRootDiv.querySelector('.ubo-overlay');
+                        if (adDiv == null) {
+                            adDiv = document.createElement('div');
+                            adDiv.className = 'ubo-overlay';
+                            adDiv.innerHTML = '<div class="player-ad-notice" style="color: white; background-color: rgba(0, 0, 0, 0.8); position: absolute; top: 0px; left: 0px; padding: 5px;"><p></p></div>';
+                            adDiv.style.display = 'none';
+                            adDiv.P = adDiv.querySelector('p');
+                            playerRootDiv.appendChild(adDiv);
+                        }
                     }
+                    return adDiv;
                 }
-                else if (e.data.key == 'UboChannelNameM3U8Changed') {
-                    //console.log('M3U8 channel name changed to ' + e.data.value);
-                }
-                else if (e.data.key == 'UboReloadPlayer') {
-                    reloadTwitchPlayer();
-                }
-                else if (e.data.key == 'UboPauseResumePlayer') {
-                    reloadTwitchPlayer(false, true);
-                }
-                else if (e.data.key == 'UboSeekPlayer') {
-                    reloadTwitchPlayer(true);
-                }
-            }
-            function getAdDiv() {
-                var playerRootDiv = document.querySelector('.video-player');
-                var adDiv = null;
-                if (playerRootDiv != null) {
-                    adDiv = playerRootDiv.querySelector('.ubo-overlay');
-                    if (adDiv == null) {
-                        adDiv = document.createElement('div');
-                        adDiv.className = 'ubo-overlay';
-                        adDiv.innerHTML = '<div class="player-ad-notice" style="color: white; background-color: rgba(0, 0, 0, 0.8); position: absolute; top: 0px; left: 0px; padding: 5px;"><p></p></div>';
-                        adDiv.style.display = 'none';
-                        adDiv.P = adDiv.querySelector('p');
-                        playerRootDiv.appendChild(adDiv);
-                    }
-                }
-                return adDiv;
             }
         }
+        var workerInstance = reinsertWorkers(newWorker, reinsert);
+        Object.defineProperty(unsafeWindow, 'Worker', {
+            get: function() {
+                return workerInstance;
+            },
+            set: function(value) {
+                if (isValidWorker(value)) {
+                    workerInstance = value;
+                } else {
+                    console.log('Attempt to set twitch worker denied');
+                }
+            }
+        });
     }
-    function getWasmWorkerUrl(twitchBlobUrl) {
+    function getWasmWorkerJs(twitchBlobUrl) {
         var req = new XMLHttpRequest();
         req.open('GET', twitchBlobUrl, false);
+        req.overrideMimeType("text/javascript");
         req.send();
-        return req.responseText.split("'")[1];
+        return req.responseText;
     }
     function onFoundAd(streamInfo, textStr, reloadPlayer) {
         console.log('Found ads, switch to backup');
@@ -147,27 +253,46 @@ twitch-videoad.js text/javascript
                 var streamM3u8Response = await realFetch(streamM3u8Url);
                 if (streamM3u8Response.status == 200) {
                     var streamM3u8 = await streamM3u8Response.text();
-                    if (streamM3u8 != null && !streamM3u8.includes(AD_SIGNIFIER)) {
-                        console.log('No more ads on main stream. Triggering player reload to go back to main stream...');
-                        streamInfo.UseBackupStream = false;
-                        postMessage({key:'UboHideAdBanner'});
-                        postMessage({key:'UboReloadPlayer'});
+                    if (streamM3u8 != null) {
+                        if (!streamM3u8.includes(AD_SIGNIFIER)) {
+                            console.log('No more ads on main stream. Triggering player reload to go back to main stream...');
+                            streamInfo.UseBackupStream = false;
+                            postMessage({key:'UboHideAdBanner'});
+                            postMessage({key:'UboReloadPlayer'});
+                        } else if (!streamM3u8.includes('"MIDROLL"') && !streamM3u8.includes('"midroll"')) {
+                            var lines = streamM3u8.replace('\r', '').split('\n');
+                            for (var i = 0; i < lines.length; i++) {
+                                var line = lines[i];
+                                if (line.startsWith('#EXTINF') && lines.length > i + 1) {
+                                    if (!line.includes(LIVE_SIGNIFIER) && !streamInfo.RequestedAds.has(lines[i + 1])) {
+                                        // Only request one .ts file per .m3u8 request to avoid making too many requests
+                                        //console.log('Fetch ad .ts file');
+                                        streamInfo.RequestedAds.add(lines[i + 1]);
+                                        fetch(lines[i + 1]).then((response)=>{response.blob()});
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-            if (streamInfo.BackupEncodings == null) {
-                return '';
-            }
         } else if (haveAdTags) {
             onFoundAd(streamInfo, textStr, true);
-            return '';
         } else {
             postMessage({key:'UboHideAdBanner'});
+        }
+        if (haveAdTags && streamInfo.BackupEncodings != null) {
+            var streamM3u8Url = streamInfo.BackupEncodings.match(/^https:.*\.m3u8.*$/m)[0];
+            var streamM3u8Response = await realFetch(streamM3u8Url);
+            if (streamM3u8Response.status == 200) {
+                textStr = await streamM3u8Response.text();
+            }
         }
         return textStr;
     }
     function hookWorkerFetch() {
-        console.log('hookWorkerFetch');
+        console.log('hookWorkerFetch (video-swap-new)');
         var realFetch = fetch;
         fetch = async function(url, options) {
             if (typeof url === 'string') {
@@ -176,7 +301,11 @@ twitch-videoad.js text/javascript
                     return new Promise(function(resolve, reject) {
                         var processAfter = async function(response) {
                             var str = await processM3U8(url, await response.text(), realFetch);
-                            resolve(new Response(str));
+                            resolve(new Response(str, {
+                                status: response.status,
+                                statusText: response.statusText,
+                                headers: response.headers
+                            }));
                         };
                         var send = function() {
                             return realFetch(url, options).then(function(response) {
@@ -203,9 +332,13 @@ twitch-videoad.js text/javascript
                             // - First m3u8 request is the m3u8 with the video encodings (360p,480p,720p,etc).
                             // - Second m3u8 request is the m3u8 for the given encoding obtained in the first request. At this point we will know if there's ads.
                             var streamInfo = StreamInfos[channelName];
-                            var useBackupStream = false;
+                            if (streamInfo != null && streamInfo.Encodings != null && (await realFetch(streamInfo.Encodings.match(/^https:.*\.m3u8$/m)[0])).status !== 200) {
+                                // The cached encodings are dead (the stream probably restarted)
+                                streamInfo = null;
+                            }
                             if (streamInfo == null || streamInfo.Encodings == null || streamInfo.BackupEncodings == null) {
                                 StreamInfos[channelName] = streamInfo = {
+                                    RequestedAds: new Set(),
                                     Encodings: null,
                                     BackupEncodings: null,
                                     IsMidroll: false,
@@ -215,7 +348,7 @@ twitch-videoad.js text/javascript
                                 for (var i = 0; i < 2; i++) {
                                     var encodingsUrl = url;
                                     if (i == 1) {
-                                        var accessTokenResponse = await getAccessToken(channelName, OPT_BACKUP_PLAYER_TYPE);
+                                        var accessTokenResponse = await getAccessToken(channelName, OPT_BACKUP_PLAYER_TYPE, OPT_BACKUP_PLATFORM);
                                         if (accessTokenResponse != null && accessTokenResponse.status === 200) {
                                             var accessToken = await accessTokenResponse.json();
                                             var urlInfo = new URL('https://usher.ttvnw.net/api/channel/hls/' + channelName + '.m3u8' + (new URL(url)).search);
@@ -244,6 +377,32 @@ twitch-videoad.js text/javascript
                                                 return;
                                             }
                                         } else {
+                                            var lowResLines = encodingsM3u8.replace('\r', '').split('\n');
+                                            var lowResBestUrl = null;
+                                            for (var j = 0; j < lowResLines.length; j++) {
+                                                if (lowResLines[j].startsWith('#EXT-X-STREAM-INF')) {
+                                                    var res = parseAttributes(lowResLines[j])['RESOLUTION'];
+                                                    if (res && lowResLines[j + 1].endsWith('.m3u8')) {
+                                                        // Assumes resolutions are correctly ordered
+                                                        lowResBestUrl = lowResLines[j + 1];
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if (lowResBestUrl != null && streamInfo.Encodings != null) {
+                                                var normalEncodingsM3u8 = streamInfo.Encodings;
+                                                var normalLines = normalEncodingsM3u8.replace('\r', '').split('\n');
+                                                for (var j = 0; j < normalLines.length - 1; j++) {
+                                                    if (normalLines[j].startsWith('#EXT-X-STREAM-INF')) {
+                                                        var res = parseAttributes(normalLines[j])['RESOLUTION'];
+                                                        if (res) {
+                                                            lowResBestUrl += ' ';// The stream doesn't load unless each url line is unique
+                                                            normalLines[j + 1] = lowResBestUrl;
+                                                        }
+                                                    }
+                                                }
+                                                encodingsM3u8 = normalLines.join('\r\n');
+                                            }
                                             streamInfo.BackupEncodings = encodingsM3u8;
                                         }
                                         var lines = encodingsM3u8.replace('\r', '').split('\n');
@@ -288,9 +447,12 @@ twitch-videoad.js text/javascript
             },
         }];
     }
-    function getAccessToken(channelName, playerType, realFetch) {
+    function getAccessToken(channelName, playerType, platform) {
+        if (!platform) {
+            platform = 'web';
+        }
         var body = null;
-        var templateQuery = 'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) {  streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) {    value    signature    __typename  }  videoPlaybackAccessToken(id: $vodID, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) {    value    signature    __typename  }}';
+        var templateQuery = 'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) {  streamPlaybackAccessToken(channelName: $login, params: {platform: "' + platform + '", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) {    value    signature    __typename  }  videoPlaybackAccessToken(id: $vodID, params: {platform: "' + platform + '", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) {    value    signature    __typename  }}';
         body = {
             operationName: 'PlaybackAccessToken_Template',
             query: templateQuery,
@@ -302,17 +464,40 @@ twitch-videoad.js text/javascript
                 'playerType': playerType
             }
         };
-        return gqlRequest(body, realFetch);
+        return gqlRequest(body);
     }
-    function gqlRequest(body, realFetch) {
-        var fetchFunc = realFetch ? realFetch : fetch;
-        return fetchFunc('https://gql.twitch.tv/gql', {
-            method: 'POST',
-            body: JSON.stringify(body),
-            headers: {
-                'client-id': CLIENT_ID,
-                'X-Device-Id': OPT_ROLLING_DEVICE_ID ? gql_device_id_rolling : gql_device_id
+    function gqlRequest(body) {
+        if (!gql_device_id) {
+            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            for (let i = 0; i < 32; i += 1) {
+                gql_device_id += chars.charAt(Math.floor(Math.random() * chars.length));
             }
+        }
+        var headers = {
+            'Client-Id': CLIENT_ID,
+            'Client-Integrity': ClientIntegrityHeader,
+            'X-Device-Id': gql_device_id,
+            'Authorization': AuthorizationHeader
+        };
+        return new Promise((resolve, reject) => {
+            const requestId = Math.random().toString(36).substring(2, 15);
+            const fetchRequest = {
+                id: requestId,
+                url: 'https://gql.twitch.tv/gql',
+                options: {
+                    method: 'POST',
+                    body: JSON.stringify(body),
+                    headers
+                }
+            };
+            pendingFetchRequests.set(requestId, {
+                resolve,
+                reject
+            });
+            postMessage({
+                key: 'FetchRequest',
+                value: fetchRequest
+            });
         });
     }
     function parseAttributes(str) {
@@ -386,9 +571,89 @@ twitch-videoad.js text/javascript
             return 0;
         }
     }
+    function postTwitchWorkerMessage(key, value) {
+        twitchWorkers.forEach((worker) => {
+            worker.postMessage({key: key, value: value});
+        });
+    }
+    function makeGmXmlHttpRequest(fetchRequest) {
+        return new Promise((resolve, reject) => {
+            GM.xmlHttpRequest({
+                method: fetchRequest.options.method,
+                url: fetchRequest.url,
+                data: fetchRequest.options.body,
+                headers: fetchRequest.options.headers,
+                onload: response => resolve(response),
+                onerror: error => reject(error)
+            });
+        });
+    }
+    // Taken from https://github.com/dimdenGD/YeahTwitter/blob/9e0520f5abe029f57929795d8de0d2e5d3751cf3/us.js#L48
+    function parseHeaders(headersString) {
+        const headers = new Headers();
+        const lines = headersString.trim().split(/[\r\n]+/);
+        lines.forEach(line => {
+            const parts = line.split(':');
+            const header = parts.shift();
+            const value = parts.join(':');
+            headers.append(header, value);
+        });
+        return headers;
+    }
+    var serverLikesThisBrowser = false;
+    var serverHatesThisBrowser = false;
+    async function handleWorkerFetchRequest(fetchRequest) {
+        try {
+            if (serverLikesThisBrowser || !serverHatesThisBrowser) {
+                const response = await unsafeWindow.realFetch(fetchRequest.url, fetchRequest.options);
+                const responseBody = await response.text();
+                const responseObject = {
+                    id: fetchRequest.id,
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: Object.fromEntries(response.headers.entries()),
+                    body: responseBody
+                };
+                if (responseObject.status === 200) {
+                    var resp = JSON.parse(responseBody);
+                    if (typeof resp.errors !== 'undefined') {
+                        serverHatesThisBrowser = true;
+                    } else {
+                        serverLikesThisBrowser = true;
+                    }
+                }
+                if (serverLikesThisBrowser || !serverHatesThisBrowser) {
+                    return responseObject;
+                }
+            }
+            if (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest !== 'undefined') {
+                fetchRequest.options.headers['User-Agent'] = 'Mozilla/5.0 (X11; Linux i686; rv:140.0) Gecko/20100101 Firefox/140.0';
+                fetchRequest.options.headers['Referer'] = 'https://www.twitch.tv/';
+                fetchRequest.options.headers['Origin'] = 'https://www.twitch.tv/';
+                fetchRequest.options.headers['Host'] = 'gql.twitch.tv';
+                const response = await makeGmXmlHttpRequest(fetchRequest);
+                const responseBody = response.responseText;
+                const responseObject = {
+                    id: fetchRequest.id,
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: Object.fromEntries(parseHeaders(response.responseHeaders).entries()),
+                    body: responseBody
+                };
+                return responseObject;
+            }
+            throw { message: 'Failed to resolve GQL request. Try the userscript version of the ad blocking solution' };
+        } catch (error) {
+            return {
+                id: fetchRequest.id,
+                error: error.message
+            };
+        }
+    }
     function hookFetch() {
-        var realFetch = window.fetch;
-        window.fetch = function(url, init, ...args) {
+        var realFetch = unsafeWindow.fetch;
+        unsafeWindow.realFetch = realFetch;
+        unsafeWindow.fetch = function(url, init, ...args) {
             if (typeof url === 'string') {
                 if (url.includes('gql')) {
                     var deviceId = init.headers['X-Device-Id'];
@@ -398,24 +663,31 @@ twitch-videoad.js text/javascript
                     if (typeof deviceId === 'string') {
                         gql_device_id = deviceId;
                     }
-                    if (gql_device_id && twitchMainWorker) {
-                        twitchMainWorker.postMessage({
-                            key: 'UboUpdateDeviceId',
-                            value: gql_device_id
-                        });
+                    if (gql_device_id) {
+                        postTwitchWorkerMessage('UboUpdateDeviceId', gql_device_id);
                     }
                     if (typeof init.body === 'string' && init.body.includes('PlaybackAccessToken')) {
                         if (OPT_ACCESS_TOKEN_PLAYER_TYPE) {
                             const newBody = JSON.parse(init.body);
-                            newBody.variables.playerType = OPT_ACCESS_TOKEN_PLAYER_TYPE;
+                            if (Array.isArray(newBody)) {
+                                for (let i = 0; i < newBody.length; i++) {
+                                    newBody[i].variables.playerType = OPT_ACCESS_TOKEN_PLAYER_TYPE;
+                                }
+                            } else {
+                                newBody.variables.playerType = OPT_ACCESS_TOKEN_PLAYER_TYPE;
+                            }
                             init.body = JSON.stringify(newBody);
                         }
-                        if (OPT_ROLLING_DEVICE_ID) {
-                            if (typeof init.headers['X-Device-Id'] === 'string') {
-                                init.headers['X-Device-Id'] = gql_device_id_rolling;
+                        if (typeof init.headers['Client-Integrity'] === 'string') {
+                            ClientIntegrityHeader = init.headers['Client-Integrity'];
+                            if (ClientIntegrityHeader) {
+                                postTwitchWorkerMessage('UpdateClientIntegrityHeader', init.headers['Client-Integrity']);
                             }
-                            if (typeof init.headers['Device-ID'] === 'string') {
-                                init.headers['Device-ID'] = gql_device_id_rolling;
+                        }
+                        if (typeof init.headers['Authorization'] === 'string') {
+                            AuthorizationHeader = init.headers['Authorization'];
+                            if (AuthorizationHeader) {
+                                postTwitchWorkerMessage('UpdateAuthorizationHeader', init.headers['Authorization']);
                             }
                         }
                     }
@@ -442,11 +714,21 @@ twitch-videoad.js text/javascript
             }
             return null;
         }
-        var reactRootNode = null;
-        var rootNode = document.querySelector('#root');
-        if (rootNode && rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current) {
-            reactRootNode = rootNode._reactRootContainer._internalRoot.current;
+        function findReactRootNode() {
+            var reactRootNode = null;
+            var rootNode = document.querySelector('#root');
+            if (rootNode && rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current) {
+                reactRootNode = rootNode._reactRootContainer._internalRoot.current;
+            }
+            if (reactRootNode == null) {
+                var containerName = Object.keys(rootNode).find(x => x.startsWith('__reactContainer'));
+                if (containerName != null) {
+                    reactRootNode = rootNode[containerName];
+                }
+            }
+            return reactRootNode;
         }
+        var reactRootNode = findReactRootNode();
         if (!reactRootNode) {
             console.log('Could not find react root');
             return;
@@ -462,7 +744,7 @@ twitch-videoad.js text/javascript
             console.log('Could not find player state');
             return;
         }
-        if (player.paused) {
+        if (player.paused || player.core?.paused) {
             return;
         }
         if (isSeek) {
@@ -477,25 +759,26 @@ twitch-videoad.js text/javascript
             player.play();
             return;
         }
-        const sink = player.mediaSinkManager || (player.core ? player.core.mediaSinkManager : null);
-        if (sink && sink.video && sink.video._ffz_compressor) {
-            const video = sink.video;
-            const volume = video.volume ? video.volume : player.getVolume();
-            const muted = player.isMuted();
-            const newVideo = document.createElement('video');
-            newVideo.volume = muted ? 0 : volume;
-            newVideo.playsInline = true;
-            video.replaceWith(newVideo);
-            player.attachHTMLVideoElement(newVideo);
-            setImmediate(() => {
-                player.setVolume(volume);
-                player.setMuted(muted);
-            });
+        const lsKeyQuality = 'video-quality';
+        const lsKeyMuted = 'video-muted';
+        const lsKeyVolume = 'volume';
+        var currentQualityLS = localStorage.getItem(lsKeyQuality);
+        var currentMutedLS = localStorage.getItem(lsKeyMuted);
+        var currentVolumeLS = localStorage.getItem(lsKeyVolume);
+        if (player?.core?.state) {
+            localStorage.setItem(lsKeyMuted, JSON.stringify({default:player.core.state.muted}));
+            localStorage.setItem(lsKeyVolume, player.core.state.volume);
         }
-        playerState.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: true });// ffz sets this false
+        if (player?.core?.state?.quality?.group) {
+            localStorage.setItem(lsKeyQuality, JSON.stringify({default:player.core.state.quality.group}));
+        }
+        playerState.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: true });
+        setTimeout(() => {
+            localStorage.setItem(lsKeyQuality, currentQualityLS);
+            localStorage.setItem(lsKeyMuted, currentMutedLS);
+            localStorage.setItem(lsKeyVolume, currentVolumeLS);
+        }, 3000);
     }
-    window.reloadTwitchPlayer = reloadTwitchPlayer;
-    hookFetch();
     function onContentLoaded() {
         // This stops Twitch from pausing the player when in another tab and an ad shows.
         // Taken from https://github.com/saucettv/VideoAdBlockForTwitch/blob/cefce9d2b565769c77e3666ac8234c3acfe20d83/chrome/content.js#L30
@@ -564,10 +847,14 @@ twitch-videoad.js text/javascript
             return realGetItem.apply(this, arguments);
         };
     }
+    unsafeWindow.reloadTwitchPlayer = reloadTwitchPlayer;
+    declareOptions(unsafeWindow);
+    hookWindowWorker();
+    hookFetch();
     if (document.readyState === "complete" || document.readyState === "loaded" || document.readyState === "interactive") {
         onContentLoaded();
     } else {
-        window.addEventListener("DOMContentLoaded", function() {
+        unsafeWindow.addEventListener("DOMContentLoaded", function() {
             onContentLoaded();
         });
     }
